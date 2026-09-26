@@ -1,1 +1,30 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>车辆召回跟踪</title><style>body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}pre{background:#f3f5f7;padding:16px;overflow:auto}button{padding:8px 14px}</style><h1>车辆安全召回与修复跟踪</h1><p>召回范围按版本发布，维修记录需结合车辆流转、零件库存、跨境许可和监管复核。</p><button onclick="loadState()">刷新状态</button><pre id="state">加载中...</pre><script>async function loadState(){state.textContent=JSON.stringify(await (await fetch('/api/state')).json(),null,2)}loadState()</script></html>
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>车辆召回跟踪</title><style>
+body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}
+pre{background:#f3f5f7;padding:16px;overflow:auto}
+button{padding:8px 14px}
+input{padding:8px;font:inherit;width:280px}
+section{margin-bottom:28px}
+h2{font-size:18px}
+</style>
+<h1>车辆安全召回与修复跟踪</h1>
+<p>召回范围按版本发布；每次转卖都会归档原车主/原国家/新车主/新国家和交接时间，维修责任按报修网点留痕，通知按版本发布时的归属存档。</p>
+<section>
+<h2>按车辆识别码查流转履历</h2>
+<input id="vin" placeholder="车辆识别码 VIN，如 LX00001">
+<button onclick="loadHistory()">查询履历</button>
+<pre id="history">输入 VIN 后查看归属变化、交接记录、维修与通知。</pre>
+</section>
+<section>
+<h2>系统状态</h2>
+<button onclick="loadState()">刷新状态</button>
+<pre id="state">加载中...</pre>
+</section>
+<script>
+async function loadState(){state.textContent=JSON.stringify(await (await fetch('/api/state')).json(),null,2)}
+async function loadHistory(){
+  const v=vin.value.trim(); if(!v){history.textContent='请输入车辆识别码';return}
+  const r=await fetch('/api/vehicles/'+encodeURIComponent(v)+'/history');
+  history.textContent=JSON.stringify(await r.json(),null,2)
+}
+loadState()
+</script>

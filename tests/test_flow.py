@@ -35,6 +35,42 @@ class RecallFlowTest(unittest.TestCase):
         self.assertEqual(2, len(detail["reports"]))
         self.assertEqual("confirmed", detail["repairs"][0]["status"])
 
+    def test_transfer_archive_keeps_repair_with_original_dealer(self):
+        recall = self.make_recall()
+        v = self.s.register_vehicle("maker", "manufacturer", "LX20000", "X", 2018, "CN", "张三")
+        self.s.add_parts("maker", "manufacturer", recall["id"], self.dealer_cn["id"], 1, 1)
+        report = self.s.report_repair("dealer", "dealer", recall["id"], v["vin"], self.dealer_cn["id"], 1, "hash", True, idempotency_key="r1")
+        moved = self.s.transfer_vehicle("dealer", "dealer", v["vin"], "SG", "Wang", handed_over_at="2026-02-01T00:00:00Z", idempotency_key="t1")
+        self.assertFalse(moved["reused"])
+        self.assertEqual({"from_owner": "张三", "from_country": "CN", "to_owner": "Wang", "to_country": "SG",
+                          "handed_over_at": "2026-02-01T00:00:00Z"},
+                         {k: moved["transfer"][k] for k in ("from_owner", "from_country", "to_owner", "to_country", "handed_over_at")})
+        self.assertEqual([report["id"]], [r["id"] for r in moved["open_repairs"]])
+        again = self.s.transfer_vehicle("dealer", "dealer", v["vin"], "SG", "Wang", handed_over_at="2026-03-01T00:00:00Z", idempotency_key="t1")
+        self.assertTrue(again["reused"])
+        self.assertEqual(moved["transfer"]["id"], again["transfer"]["id"])
+        self.assertEqual("2026-02-01T00:00:00Z", again["transfer"]["handed_over_at"])
+        confirmed = self.s.review_repair("reg", "regulator", report["id"], "confirm")
+        self.assertEqual(self.dealer_cn["id"], confirmed["dealer_id"])
+        history = self.s.vehicle_history(v["vin"])
+        self.assertEqual(1, len(history["transfers"]))
+        self.assertEqual("confirmed", history["repairs"][0]["status"])
+        self.assertEqual("D-CN", history["repairs"][0]["dealer_code"])
+        self.assertEqual([("张三", "CN"), ("Wang", "SG")], [(o["owner_name"], o["country"]) for o in history["ownership"]])
+
+    def test_next_version_notice_follows_new_owner(self):
+        v = self.s.register_vehicle("maker", "manufacturer", "LX30000", "X", 2018, "CN", "张三")
+        recall = self.make_recall()
+        first = self.s.vehicle_history(v["vin"])["notifications"]
+        self.assertEqual([("张三", "CN", 1)], [(n["owner_name"], n["country"], n["scope_version"]) for n in first])
+        self.s.transfer_vehicle("dealer", "dealer", v["vin"], "SG", "Wang", idempotency_key="t9")
+        self.s.change_scope("maker", "manufacturer", recall["id"],
+                            {"models": ["X"], "model_years": [2018], "vin_prefixes": ["LX"], "countries": ["CN"]}, recall["revision"])
+        notes = self.s.vehicle_history(v["vin"])["notifications"]
+        self.assertEqual([("张三", "CN", 1), ("Wang", "SG", 2)], [(n["owner_name"], n["country"], n["scope_version"]) for n in notes])
+        pending = self.s.unfinished("reg", "regulator", recall["id"])
+        self.assertEqual("Wang", pending["vehicles"][0]["owner_name"])
+
     def test_shortage_wrong_remedy_permissions_and_duplicate(self):
         recall = self.make_recall()
         v = self.s.register_vehicle("maker", "manufacturer", "LX10000", "X", 2018, "CN", "赵六")
