@@ -12,11 +12,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+import transfer_rules
+from transfer_archive import SCHEMA as TRANSFER_ARCHIVE_SCHEMA
+from transfer_archive import TransferArchive
+
 DB_PATH = Path(__file__).with_name("data.db")
 
 
 def now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def j(value: object) -> str:
@@ -78,7 +82,9 @@ class Store:
         CREATE TABLE IF NOT EXISTS notifications (
           id INTEGER PRIMARY KEY AUTOINCREMENT, recall_id INTEGER NOT NULL REFERENCES recalls(id),
           vehicle_id INTEGER NOT NULL REFERENCES vehicles(id), scope_version INTEGER NOT NULL,
-          channel TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL,
+          channel TEXT NOT NULL, status TEXT NOT NULL,
+          recipient_name TEXT NOT NULL DEFAULT '', recipient_country TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL,
           UNIQUE(recall_id,vehicle_id,scope_version)
         );
         CREATE TABLE IF NOT EXISTS regulatory_reports (
@@ -91,6 +97,7 @@ class Store:
           entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, details_json TEXT NOT NULL
         );
         """)
+        self.conn.executescript(TRANSFER_ARCHIVE_SCHEMA)
         self.conn.commit()
 
     def audit(self, actor: str, action: str, entity_type: str, entity_id: object, details: dict) -> None:
@@ -104,6 +111,7 @@ class Store:
 class RecallService:
     def __init__(self, store: Store):
         self.store, self.conn = store, store.conn
+        self.archive = TransferArchive(store.conn)
 
     @staticmethod
     def _actor(actor: str | None, role: str | None, allowed: set[str]) -> str:
@@ -140,13 +148,46 @@ class RecallService:
             raise ApiError(409, "车辆识别码已存在") from exc
         return {"id": cur.lastrowid, "vin": vin, "model": model, "model_year": model_year, "country": country, "owner_name": owner_name}
 
-    def transfer_vehicle(self, actor: str | None, role: str | None, vin: str, country: str, owner_name: str) -> dict:
+    def transfer_vehicle(self, actor: str | None, role: str | None, vin: str, country: str, owner_name: str,
+                         idempotency_key: str = "", handover_at: str = "") -> dict:
         actor = self._actor(actor, role, {"dealer", "regulator"})
         vehicle = self._row("vehicles", vin.upper(), "vin")
+        country, owner_name = country.strip(), owner_name.strip()
+        try:
+            transfer_rules.require_handover_fields(owner_name, country, idempotency_key)
+        except transfer_rules.TransferRuleError as exc:
+            raise ApiError(exc.status, exc.message) from exc
+        existing = self.archive.find_by_key(vehicle["id"], idempotency_key.strip())
+        if existing:
+            return {"transfer": existing, "vehicle": dict(self._row("vehicles", vehicle["id"])), "deduplicated": True}
+        try:
+            transfer_rules.require_handover_change(vehicle, owner_name, country)
+            handover_at = transfer_rules.normalize_handover_at(handover_at, now())
+        except transfer_rules.TransferRuleError as exc:
+            raise ApiError(exc.status, exc.message) from exc
+        repairs = self.conn.execute("SELECT id,status FROM repairs WHERE vehicle_id=?", (vehicle["id"],)).fetchall()
+        open_repairs = transfer_rules.in_progress_repairs(repairs)
         with self.conn:
             self.conn.execute("UPDATE vehicles SET country=?,owner_name=?,updated_at=? WHERE id=?", (country, owner_name, now(), vehicle["id"]))
-            self.store.audit(actor, "vehicle.transfer", "vehicle", vehicle["id"], {"old_country": vehicle["country"], "new_country": country, "owner_name": owner_name})
-        return dict(self._row("vehicles", vehicle["id"]))
+            record = self.archive.record(vehicle_id=vehicle["id"], from_owner=vehicle["owner_name"], from_country=vehicle["country"],
+                                         to_owner=owner_name, to_country=country, handover_at=handover_at,
+                                         in_progress_repairs=open_repairs, idempotency_key=idempotency_key.strip(),
+                                         actor=actor, recorded_at=now())
+            self.store.audit(actor, "vehicle.transfer", "vehicle", vehicle["id"],
+                             {"transfer_id": record["id"], "old_country": vehicle["country"], "new_country": country,
+                              "owner_name": owner_name, "handover_at": handover_at, "in_progress_repairs": open_repairs})
+        return {"transfer": record, "vehicle": dict(self._row("vehicles", vehicle["id"])), "deduplicated": False}
+
+    def vehicle_history(self, vin: str) -> dict:
+        vehicle = dict(self._row("vehicles", vin.upper(), "vin"))
+        transfers = self.archive.for_vehicle(vehicle["id"])
+        repairs = []
+        for row in self.conn.execute("SELECT * FROM repairs WHERE vehicle_id=? ORDER BY id", (vehicle["id"],)):
+            repair = dict(row)
+            repair["owner_at_report"], repair["country_at_report"] = transfer_rules.ownership_at(vehicle, transfers, repair["reported_at"])
+            repairs.append(repair)
+        return {"vehicle": vehicle, "transfers": transfers,
+                "ownership_timeline": transfer_rules.ownership_timeline(vehicle, transfers), "repairs": repairs}
 
     def create_recall(self, actor: str | None, role: str | None, campaign_code: str, title: str, scope: dict, remedy: dict) -> dict:
         actor = self._actor(actor, role, {"manufacturer"})
@@ -270,8 +311,10 @@ class RecallService:
         vehicles = [row for row in self.conn.execute("SELECT * FROM vehicles ORDER BY id") if self._in_scope(row, scope)]
         with self.conn:
             for vehicle in vehicles:
-                self.conn.execute("""INSERT OR IGNORE INTO notifications(recall_id,vehicle_id,scope_version,channel,status,created_at)
-                                     VALUES(?,?,?, 'owner-notice','queued',?)""", (recall_id, vehicle["id"], scope_version, now()))
+                recipient = transfer_rules.notification_recipient(vehicle)
+                self.conn.execute("""INSERT OR IGNORE INTO notifications(recall_id,vehicle_id,scope_version,channel,status,recipient_name,recipient_country,created_at)
+                                     VALUES(?,?,?, 'owner-notice','queued',?,?,?)""",
+                                  (recall_id, vehicle["id"], scope_version, recipient["recipient_name"], recipient["recipient_country"], now()))
             payload = {"campaign_code": recall["campaign_code"], "scope_version": scope_version, "scope": scope,
                        "remedy_version": recall["remedy_version"], "affected_count": len(vehicles)}
             self.conn.execute("INSERT OR IGNORE INTO regulatory_reports(recall_id,scope_version,payload_json,status,created_at) VALUES(?,?,?, 'queued',?)",
@@ -288,7 +331,8 @@ class RecallService:
         for vehicle in self.conn.execute("SELECT * FROM vehicles ORDER BY vin"):
             if self._in_scope(vehicle, scope) and vehicle["id"] not in confirmed:
                 items.append({"vin": vehicle["vin"], "model": vehicle["model"], "model_year": vehicle["model_year"],
-                              "country": vehicle["country"], "risk": "high" if current_year - int(vehicle["model_year"]) >= 8 else "normal"})
+                              "owner_name": vehicle["owner_name"], "country": vehicle["country"],
+                              "risk": "high" if current_year - int(vehicle["model_year"]) >= 8 else "normal"})
         return {"recall_id": recall_id, "scope_version": recall["scope_version"], "unfinished_count": len(items), "vehicles": items}
 
     @staticmethod
@@ -311,6 +355,7 @@ class RecallService:
         result = self._recall_dict(self._row("recalls", recall_id))
         result["repairs"] = [dict(row) for row in self.conn.execute("SELECT * FROM repairs WHERE recall_id=? ORDER BY id", (recall_id,))]
         result["reports"] = [dict(row) for row in self.conn.execute("SELECT * FROM regulatory_reports WHERE recall_id=? ORDER BY scope_version", (recall_id,))]
+        result["notifications"] = [dict(row) for row in self.conn.execute("SELECT * FROM notifications WHERE recall_id=? ORDER BY scope_version, vehicle_id", (recall_id,))]
         return result
 
     def state(self) -> dict:
@@ -351,6 +396,9 @@ class Handler(BaseHTTPRequestHandler):
             elif len(p) == 3 and p[:2] == ["api", "recalls"]: out = self.service.recall_detail(int(p[2]))
             elif len(p) == 4 and p[:2] == ["api", "recalls"] and p[3] == "unfinished":
                 out = self.service.unfinished(self.headers.get("X-Actor"), self.headers.get("X-Role"), int(p[2]))
+            elif len(p) == 4 and p[:2] == ["api", "vehicles"] and p[3] == "history": out = self.service.vehicle_history(p[2])
+            elif p == ["vehicle"]:
+                page = (Path(__file__).parent / "static" / "vehicle.html").read_bytes(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(page))); self.end_headers(); self.wfile.write(page); return
             elif not p:
                 page = (Path(__file__).parent / "static" / "index.html").read_bytes(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(page))); self.end_headers(); self.wfile.write(page); return
             else: raise ApiError(404, "接口不存在")
@@ -363,7 +411,7 @@ class Handler(BaseHTTPRequestHandler):
             p, body = self._parts(), self._body(); actor, role = self.headers.get("X-Actor"), self.headers.get("X-Role")
             if p == ["api", "dealers"]: out = self.service.register_dealer(actor, role, body.get("code", ""), body.get("name", ""), body.get("country", ""))
             elif p == ["api", "vehicles"]: out = self.service.register_vehicle(actor, role, body.get("vin", ""), body.get("model", ""), int(body.get("model_year", 0)), body.get("country", ""), body.get("owner_name", ""))
-            elif len(p) == 4 and p[:2] == ["api", "vehicles"] and p[3] == "transfer": out = self.service.transfer_vehicle(actor, role, p[2], body.get("country", ""), body.get("owner_name", ""))
+            elif len(p) == 4 and p[:2] == ["api", "vehicles"] and p[3] == "transfer": out = self.service.transfer_vehicle(actor, role, p[2], body.get("country", ""), body.get("owner_name", ""), body.get("idempotency_key", ""), body.get("handover_at", ""))
             elif p == ["api", "recalls"]: out = self.service.create_recall(actor, role, body.get("campaign_code", ""), body.get("title", ""), body.get("scope", {}), body.get("remedy", {}))
             elif len(p) == 4 and p[:2] == ["api", "recalls"] and p[3] == "submit": out = self.service.submit_recall(actor, role, int(p[2]), int(body.get("expected_version", -1)))
             elif len(p) == 4 and p[:2] == ["api", "recalls"] and p[3] == "review": out = self.service.review_recall(actor, role, int(p[2]), body.get("decision", ""), int(body.get("expected_version", -1)), body.get("note", ""))

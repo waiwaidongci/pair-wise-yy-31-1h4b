@@ -21,7 +21,7 @@ class RecallFlowTest(unittest.TestCase):
         recall = self.make_recall()
         vehicle = self.s.register_vehicle("maker", "manufacturer", "LX00001", "X", 2018, "CN", "张三")
         self.s.register_vehicle("maker", "manufacturer", "LX00002", "X", 2018, "CN", "李四")
-        self.s.transfer_vehicle("dealer", "dealer", vehicle["vin"], "SG", "Wang")
+        self.s.transfer_vehicle("dealer", "dealer", vehicle["vin"], "SG", "Wang", idempotency_key="t-1")
         self.s.add_parts("maker", "manufacturer", recall["id"], self.dealer_sg["id"], 1, 2)
         report = self.s.report_repair("dealer", "dealer", recall["id"], vehicle["vin"], self.dealer_sg["id"], 1, "abc123", True, "BP-9", "repair-1")
         self.assertEqual("reported", report["status"])

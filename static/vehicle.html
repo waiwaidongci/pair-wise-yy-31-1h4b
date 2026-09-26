@@ -1,0 +1,50 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>车辆流转档案</title>
+<style>
+body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}
+input,button{padding:8px 14px;font-size:16px}
+table{border-collapse:collapse;width:100%;margin:12px 0}
+th,td{border:1px solid #d0d7de;padding:6px 10px;text-align:left}
+section{background:#f8f9fa;padding:4px 16px 16px;border-radius:8px;margin-bottom:12px}
+#error{color:#b00020}
+</style>
+<h1>车辆流转档案</h1>
+<p>按车辆识别码查看完整转卖流转、维修记录和归属变化；报修时的归属按交接时间还原，用于监管核查。<a href="/">返回召回总览</a></p>
+<form onsubmit="return loadHistory()">
+<input id="vin" placeholder="车辆识别码 VIN" size="24">
+<button type="submit">查询</button>
+</form>
+<p id="error"></p>
+<div id="result" hidden>
+<section><h2>当前归属</h2><div id="vehicle"></div></section>
+<section><h2>归属变化时间线</h2><div id="timeline"></div></section>
+<section><h2>流转记录</h2><div id="transfers"></div></section>
+<section><h2>维修记录</h2><div id="repairs"></div></section>
+</div>
+<script>
+const el=id=>document.getElementById(id);
+const STATUS={reported:"已报修（在修）",confirmed:"已确认",flagged:"已标记"};
+function esc(s){return String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]))}
+function table(cols,rows){
+  if(!rows.length)return "<p>暂无记录</p>";
+  return "<table><tr>"+cols.map(c=>"<th>"+c+"</th>").join("")+"</tr>"
+    +rows.map(r=>"<tr>"+r.map(c=>"<td>"+esc(c)+"</td>").join("")+"</tr>").join("")+"</table>";
+}
+async function loadHistory(){
+  const vin=el("vin").value.trim();el("error").textContent="";el("result").hidden=true;
+  if(!vin)return false;
+  const resp=await fetch("/api/vehicles/"+encodeURIComponent(vin)+"/history");
+  const data=await resp.json();
+  if(!resp.ok){el("error").textContent=data.error||"查询失败";return false}
+  const v=data.vehicle;
+  el("vehicle").innerHTML=table(["识别码","车型","年款","现任车主","所在国家"],[[v.vin,v.model,v.model_year,v.owner_name,v.country]]);
+  el("timeline").innerHTML=table(["车主","国家","起始时间","来源"],
+    data.ownership_timeline.map(o=>[o.owner_name,o.country,o.since||"登记时起",o.source]));
+  el("transfers").innerHTML=table(["序号","原车主","原国家","新车主","新国家","交接时间","转出时在修单据"],
+    data.transfers.map(t=>[t.id,t.from_owner,t.from_country,t.to_owner,t.to_country,t.handover_at,(t.in_progress_repairs||[]).join(", ")||"无"]));
+  el("repairs").innerHTML=table(["单号","召回","网点","方案版本","状态","报修时间","报修时车主","报修时国家"],
+    data.repairs.map(r=>[r.id,r.recall_id,r.dealer_id,r.remedy_version,STATUS[r.status]||r.status,r.reported_at,r.owner_at_report,r.country_at_report]));
+  el("result").hidden=false;return false;
+}
+const q=new URLSearchParams(location.search).get("vin");
+if(q){el("vin").value=q;loadHistory()}
+</script>
